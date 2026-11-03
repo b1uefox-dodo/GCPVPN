@@ -1,0 +1,53 @@
+const PROJECT='tongshe', ZONE='us-west1-b', VM='vps-ai-node';
+const enc=new TextEncoder();
+const b64=b=>btoa(String.fromCharCode(...new Uint8Array(b))).replace(/=/g,'').replace(/\+/g,'-').replace(/\//g,'_');
+const json=(x,s=200)=>new Response(JSON.stringify(x),{status:s,headers:{'content-type':'application/json; charset=utf-8','cache-control':'no-store','x-content-type-options':'nosniff'}});
+async function token(env){
+  const c=JSON.parse(env.GCP_SERVICE_ACCOUNT_JSON); const now=Math.floor(Date.now()/1000);
+  const head=b64(enc.encode(JSON.stringify({alg:'RS256',typ:'JWT'})));
+  const body=b64(enc.encode(JSON.stringify({iss:c.client_email,scope:'https://www.googleapis.com/auth/cloud-platform',aud:'https://oauth2.googleapis.com/token',iat:now,exp:now+300})));
+  const key=Uint8Array.from(atob(c.private_key.replace(/-----[^-]+-----/g,'').replace(/\s/g,'')),x=>x.charCodeAt(0));
+  const priv=await crypto.subtle.importKey('pkcs8',key,{name:'RSASSA-PKCS1-v1_5',hash:'SHA-256'},false,['sign']);
+  const assertion=head+'.'+body+'.'+b64(await crypto.subtle.sign('RSASSA-PKCS1-v1_5',priv,enc.encode(head+'.'+body)));
+  const r=await fetch('https://oauth2.googleapis.com/token',{method:'POST',headers:{'content-type':'application/x-www-form-urlencoded'},body:new URLSearchParams({grant_type:'urn:ietf:params:oauth:grant-type:jwt-bearer',assertion})});
+  if(!r.ok)throw Error('Google 身份验证失败'); return (await r.json()).access_token;
+}
+async function api(t,url,options={}){const r=await fetch(url,{...options,headers:{authorization:'Bearer '+t,...options.headers}});if(!r.ok)throw Error('Google Cloud 返回 '+r.status);return r.json();}
+const base=`https://compute.googleapis.com/compute/v1/projects/${PROJECT}/zones/${ZONE}/instances/${VM}`;
+async function usage(t,id){
+  const now=new Date(), p=new Intl.DateTimeFormat('en-US',{timeZone:'America/Los_Angeles',year:'numeric',month:'2-digit'}).formatToParts(now), n=Object.fromEntries(p.map(x=>[x.type,x.value]));
+  // Start early enough to cover Pacific midnight; trim points at the correct zoned boundary below.
+  const first=new Date(`${n.year}-${n.month}-01T08:00:00Z`); if(new Date(`${n.year}-${n.month}-01T07:00:00Z`).toLocaleString('en-US',{timeZone:'America/Los_Angeles',hour:'numeric',hour12:false}).startsWith('24')) first.setUTCHours(7);
+  const q=new URLSearchParams({'filter':`metric.type="compute.googleapis.com/instance/network/sent_bytes_count" AND resource.type="gce_instance" AND resource.label.instance_id="${id}"`,'interval.startTime':first.toISOString(),'interval.endTime':now.toISOString(),'aggregation.alignmentPeriod':'3600s','aggregation.perSeriesAligner':'ALIGN_SUM','view':'FULL'});
+  let sum=0,next; do {if(next)q.set('pageToken',next);const d=await api(t,`https://monitoring.googleapis.com/v3/projects/${PROJECT}/timeSeries?${q}`);for(const ts of d.timeSeries||[]) for(const point of ts.points||[])sum+=Number(point.value.int64Value??point.value.doubleValue??0);next=d.nextPageToken;}while(next);
+  return {bytes:sum,source:'Cloud Monitoring',note:'统计有延迟，仅供参考；停机由服务器本地计数器独立执行。'};
+}
+function share(c,ip){return `vless://${c.uuid}@${ip}:8443?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${encodeURIComponent(c.sni)}&fp=chrome&pbk=${encodeURIComponent(c.public_key)}&sid=${encodeURIComponent(c.short_id)}&type=tcp#GCP-US-West-AI-Node`;}
+async function handle(req,env){
+  if(!req.headers.get('oai-authenticated-user-id'))return json({error:'请先登录控制台'},401);
+  const u=new URL(req.url);if(u.pathname==='/')return new Response(PAGE,{headers:{'content-type':'text/html; charset=utf-8','cache-control':'no-store','content-security-policy':"default-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'",'x-content-type-options':'nosniff','referrer-policy':'no-referrer'}});
+  if(!env.GCP_SERVICE_ACCOUNT_JSON)return json({error:'尚未连接 Google Cloud'},503);
+  if(req.method==='POST' && (req.headers.get('origin')!==u.origin||req.headers.get('content-type')!=='application/json'))return json({error:'请求来源无效'},403);
+  const t=await token(env);
+  if(u.pathname==='/api/status'&&req.method==='GET'){
+    const v=await api(t,base);let traffic=null,trafficError=null;try{traffic=await usage(t,v.id);}catch(e){trafficError='用量暂不可用';}
+    const ip=v.networkInterfaces?.[0]?.accessConfigs?.[0]?.natIP||null;
+    return json({status:v.status,ip,zone:ZONE,machine:v.machineType?.split('/').pop(),traffic,trafficError,limitGiB:550});
+  }
+  if(u.pathname==='/api/config'&&req.method==='GET'){
+    if(!env.VPN_CLIENT_CONFIG)return json({error:'客户端配置尚未连接'},503);
+    const v=await api(t,base),ip=v.networkInterfaces?.[0]?.accessConfigs?.[0]?.natIP;if(!ip)return json({error:'实例没有公网 IP，请先启动'},409);
+    return json({link:share(JSON.parse(env.VPN_CLIENT_CONFIG),ip),ip});
+  }
+  if(u.pathname==='/api/action'&&req.method==='POST'){
+    const d=await req.json(); if(!['start','stop'].includes(d.action))return json({error:'不支持的操作'},400);
+    const v=await api(t,base);if(d.action==='stop'&&v.status!=='RUNNING'||d.action==='start'&&v.status!=='TERMINATED')return json({error:'节点当前状态不允许此操作：'+v.status},409);
+    const op=await api(t,base+'/'+d.action,{method:'POST'});return json({operation:op.name,message:'操作已提交，状态更新可能需要一些时间。'});
+  }
+  return json({error:'未找到'},404);
+}
+export default {async fetch(req,env){try{return await handle(req,env)}catch(e){return json({error:e.message||'请求失败'},500)}}};
+const PAGE=`<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>节点控制台</title><style>
+:root{font-family:Inter,system-ui,-apple-system,'Segoe UI',sans-serif;color:#17251f;background:#f5f7f2}*{box-sizing:border-box}body{margin:0}header{background:#133d2e;color:#fff;padding:24px max(24px,calc((100vw - 1080px)/2)) 52px}.top{display:flex;justify-content:space-between;align-items:center;font-size:14px}.logo{font-weight:750;letter-spacing:.03em}.tag{color:#c1dfc7}h1{font-size:32px;margin:48px 0 8px}header p{margin:0;color:#c8ddcf}.wrap{max-width:1080px;margin:-24px auto 40px;padding:0 20px}.grid{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}.card{background:#fff;border:1px solid #e1e9e1;border-radius:16px;padding:22px;box-shadow:0 4px 18px #1d412509}.label{font-size:13px;color:#687b6e}.value{font-size:23px;font-weight:700;margin:12px 0}.small{font-size:13px;color:#748478;line-height:1.6}.panel{margin-top:16px}.head{display:flex;justify-content:space-between;align-items:center;gap:10px}.head h2{font-size:18px;margin:0}.bar{height:9px;background:#eaf0e9;border-radius:10px;overflow:hidden;margin:20px 0 8px}.bar span{display:block;height:100%;background:#44a674;width:0}.controls{display:flex;gap:10px;flex-wrap:wrap;margin-top:20px}button{border:0;border-radius:10px;padding:12px 16px;font:inherit;font-size:14px;font-weight:650;cursor:pointer;background:#eaf2eb;color:#245640}button.primary{background:#196841;color:white}button.danger{background:#fff0ec;color:#b23d2d}button:disabled{opacity:.48;cursor:not-allowed}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#f4f7f3;padding:15px;border-radius:10px;font-size:12px;line-height:1.5}.notice{margin-top:14px;color:#667c6b;font-size:13px;line-height:1.6}#message{min-height:20px;margin-top:15px;color:#96612d}footer{font-size:12px;color:#88978a;text-align:center;margin-top:26px}@media(max-width:680px){.grid{grid-template-columns:1fr}header{padding-bottom:48px}h1{margin-top:30px;font-size:27px}.card{padding:18px}}
+</style></head><body><header><div class="top"><span class="logo">● NODE / CONTROL</span><span class="tag">私有控制台</span></div><h1>你的节点，一目了然。</h1><p>查看状态、管理实例与获取最新连接配置。</p></header><main class="wrap"><div class="grid"><section class="card"><div class="label">节点状态</div><div id="status" class="value">读取中…</div><div class="small">vps-ai-node · us-west1-b</div></section><section class="card"><div class="label">当前公网 IP</div><div id="ip" class="value">—</div><div class="small">临时地址，停止后可能变更</div></section><section class="card"><div class="label">机器规格</div><div id="machine" class="value">—</div><div class="small">Google Cloud · 俄勒冈</div></section></div><section class="card panel"><div class="head"><h2>本月出站流量</h2><span class="small">安全阈值 550 GiB</span></div><div class="bar"><span id="progress"></span></div><div id="traffic" class="small">读取中…</div><div class="notice">Cloud Monitoring 数据可能延迟，实际停机依据服务器每分钟记录的主网卡流量；其他项目的用量不包含在此处。</div></section><section class="card panel"><div class="head"><h2>节点管理</h2><button id="refresh">刷新状态</button></div><div class="small">更换 IP 需要先停止再启动；新 IP 不保证可用。达到流量上限后，节点会再次自动停机。</div><div class="controls"><button id="stop" class="danger" disabled>停止节点</button><button id="start" class="primary" disabled>启动节点</button><button id="config" disabled>获取最新连接</button></div><div id="message" role="status"></div><pre id="result" hidden></pre><button id="copy" hidden>复制连接</button></section><footer>流量及预算提醒为辅助保护，无法保证费用不超出赠金。</footer></main><script>
+const $=id=>document.getElementById(id);let state='';async function call(path,options){const r=await fetch(path,{cache:'no-store',...options});const j=await r.json();if(!r.ok)throw Error(j.error||'操作失败');return j}function err(e){$('message').textContent=e.message}async function refresh(){try{const d=await call('/api/status');state=d.status;$('status').textContent=({RUNNING:'运行中',TERMINATED:'已停止',STOPPING:'正在停止',PROVISIONING:'正在启动',STAGING:'正在启动'})[state]||state;$('ip').textContent=d.ip||'暂无';$('machine').textContent=d.machine||'—';$('stop').disabled=state!=='RUNNING';$('start').disabled=state!=='TERMINATED';$('config').disabled=!d.ip;if(d.traffic){const n=d.traffic.bytes/1073741824;$('traffic').textContent=n.toFixed(2)+' GiB / 550 GiB · 统计可能延迟';$('progress').style.width=Math.min(100,n/550*100)+'%'}else $('traffic').textContent=d.trafficError||'暂无数据';$('message').textContent=''}catch(e){err(e)}}$('refresh').onclick=refresh;for(const a of ['stop','start'])$(a).onclick=async()=>{if(!confirm(a==='stop'?'停止节点？当前连接会中断，临时 IP 可能释放。':'启动节点？可能产生费用；超出流量阈值会再次停机。'))return;try{$(a).disabled=true;const d=await call('/api/action',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({action:a})});$('message').textContent=d.message;setTimeout(refresh,7000)}catch(e){err(e);refresh()}};$('config').onclick=async()=>{try{const d=await call('/api/config');$('result').textContent=d.link;$('result').hidden=false;$('copy').hidden=false}catch(e){err(e)}};$('copy').onclick=()=>navigator.clipboard.writeText($('result').textContent).then(()=>{$('message').textContent='已复制连接'}).catch(()=>{$('message').textContent='请手动复制连接'});refresh();</script></body></html>`;
