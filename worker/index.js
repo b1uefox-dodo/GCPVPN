@@ -17,7 +17,7 @@ const base=`https://compute.googleapis.com/compute/v1/projects/${PROJECT}/zones/
 async function usage(t,id){
   const now=new Date(), p=new Intl.DateTimeFormat('en-US',{timeZone:'America/Los_Angeles',year:'numeric',month:'2-digit'}).formatToParts(now), n=Object.fromEntries(p.map(x=>[x.type,x.value]));
   // Start early enough to cover Pacific midnight; trim points at the correct zoned boundary below.
-  const first=new Date(`${n.year}-${n.month}-01T08:00:00Z`); if(new Date(`${n.year}-${n.month}-01T07:00:00Z`).toLocaleString('en-US',{timeZone:'America/Los_Angeles',hour:'numeric',hour12:false}).startsWith('24')) first.setUTCHours(7);
+  const first=new Date(`${n.year}-${n.month}-01T08:00:00Z`); if(['00','24'].includes(new Date(`${n.year}-${n.month}-01T07:00:00Z`).toLocaleString('en-US',{timeZone:'America/Los_Angeles',hour:'2-digit',hour12:false}))) first.setUTCHours(7);
   const q=new URLSearchParams({'filter':`metric.type="compute.googleapis.com/instance/network/sent_bytes_count" AND resource.type="gce_instance" AND resource.label.instance_id="${id}"`,'interval.startTime':first.toISOString(),'interval.endTime':now.toISOString(),'aggregation.alignmentPeriod':'3600s','aggregation.perSeriesAligner':'ALIGN_SUM','view':'FULL'});
   let sum=0,next; do {if(next)q.set('pageToken',next);const d=await api(t,`https://monitoring.googleapis.com/v3/projects/${PROJECT}/timeSeries?${q}`);for(const ts of d.timeSeries||[]) for(const point of ts.points||[])sum+=Number(point.value.int64Value??point.value.doubleValue??0);next=d.nextPageToken;}while(next);
   return {bytes:sum,source:'Cloud Monitoring',note:'统计有延迟，仅供参考；停机由服务器本地计数器独立执行。'};
